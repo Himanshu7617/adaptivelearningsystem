@@ -50,3 +50,4 @@ temp/
 
 # Misc
 *.local
+/src/generated/prisma

@@ -1,0 +1,24 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+}
+
+model Session {
+  session_id         String   @id
+  topic              String
+  mastery            Float    @default(0)
+  asked_questions    Json
+  correct_answers    Int      @default(0)
+  wrong_answers      Int      @default(0)
+  current_difficulty String   @default("easy")
+  filePath           String
+  createdAt          DateTime @default(now())
+}

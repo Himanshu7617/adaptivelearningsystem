@@ -1,22 +1,12 @@
 import {Router} from "express";
 import dotenv from "dotenv";
-import path from "path";
-import { predict_next_difficulty } from "../services/ml.service.js";
+import { fetch_questions, get_first_question, get_next_question } from "../controllers/question.controller.js";
 dotenv.config();
 
 const router = Router();
 
-router.get('/', (req, res) => { 
-    res.send("what is your name");
-})
+router.post('/', fetch_questions);
+router.get('/start-session', get_first_question);
+router.get('/submit', get_next_question);
 
-router.post('/submit',  async (req,res) => { 
-    const features = req.body;
-
-
-    const result = await predict_next_difficulty(features)
-    res.send(result);
-
-
-})
 export default router;

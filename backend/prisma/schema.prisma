@@ -14,11 +14,41 @@ datasource db {
 model Session {
   session_id         String   @id
   topic              String
-  mastery            Float    @default(0)
+  mastery            Float    @default(0.1) // Represents knowledge score (0 to 1)
   asked_questions    Json
   correct_answers    Int      @default(0)
   wrong_answers      Int      @default(0)
   current_difficulty String   @default("easy")
-  filePath           String
   createdAt          DateTime @default(now())
+
+  // New fields for the upgraded rule-based system
+  confidence         Float    @default(0.5)
+  engagement         Float    @default(0.8)
+  cognitive_load     Float    @default(0.2)
+  fatigue            Float    @default(0.0)
+  history            Json     @default("[]")
+
+  questions          Question[]
+}
+
+model Question {
+  question_id          String   @id @default(uuid()) @map("question_id")
+  session_id           String   @map("session_id")
+  session              Session  @relation(fields: [session_id], references: [session_id], onDelete: Cascade)
+  
+  id                   String   @map("id") // Original ID like "q1", "q2"
+  difficulty           String   @map("difficulty")
+  questionType         String   @default("mcq") @map("question_type")
+  question             String   @map("question")
+  options              Json     @map("options")
+  correctAnswer        String   @map("correct_answer")
+  explanation          String   @map("explanation")
+  estimatedTimeSeconds Int      @default(30) @map("estimated_time_seconds")
+  concepts             Json     @default("[]") @map("concepts")
+  tags                 Json     @default("[]") @map("tags")
+  learningObjective    String   @default("") @map("learning_objective")
+  prerequisiteLevel    Int      @default(1) @map("prerequisite_level")
+  difficultyScore      Int      @default(1) @map("difficulty_score")
+  sourceType           String   @default("generated") @map("source_type")
+  asked                Boolean  @default(false) @map("asked")
 }

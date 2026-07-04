@@ -1,25 +1,47 @@
 import path from "path";
 import fs from "fs/promises";
 import { get_question_by_topic } from "../services/ai.service.js";
-import { MASTERY_THRESHOLD } from "../services/session.service.js";
-import { get_mastery, predict_next_difficulty } from "../utils/questions.util.js";
+import { calculateStateAndNextQuestion } from "../utils/ruleEngine.js";
 import { v4 as uuidv4 } from "uuid";
 import prisma from "../config/db.js";
+
+const MASTERY_THRESHOLD_NEW = 0.9;
 
 const getSessionId = (req) => req.body?.session_id ?? req.query?.session_id;
 
 const getQuestionsFromSession = async (session) => {
-    const raw = await fs.readFile(session.filePath, "utf-8");
-    const file_content = JSON.parse(raw);
-    return file_content.questions ?? [];
+    return await prisma.question.findMany({
+        where: { session_id: session.session_id }
+    });
 };
 
 const pickQuestion = (questions, difficulty, askedQuestions = []) => {
-    return questions.find(
+    // 1. Try to find an unasked question of the target difficulty
+    const targetUnasked = questions.find(
         question =>
             question.difficulty === difficulty &&
             !askedQuestions.includes(question.id)
-    ) ?? questions.find(question => question.difficulty === difficulty);
+    );
+    if (targetUnasked) return targetUnasked;
+
+    // 2. Try to find any unasked question regardless of difficulty (ordered by closeness to target difficulty)
+    const order = ["easy", "medium", "hard"];
+    const targetIdx = order.indexOf(difficulty);
+    
+    // Sort remaining difficulties by closeness to target difficulty
+    const difficultiesSorted = [...order].sort((a, b) => {
+        return Math.abs(order.indexOf(a) - targetIdx) - Math.abs(order.indexOf(b) - targetIdx);
+    });
+
+    for (const diff of difficultiesSorted) {
+        const unasked = questions.find(
+            question => question.difficulty === diff && !askedQuestions.includes(question.id)
+        );
+        if (unasked) return unasked;
+    }
+
+    // 3. Fallback: return any question of the target difficulty, even if asked
+    return questions.find(question => question.difficulty === difficulty) ?? questions[0];
 };
 
 export const fetch_questions = async (req, res) => {
@@ -32,31 +54,44 @@ export const fetch_questions = async (req, res) => {
     }
 
     try {
-        const questions = await get_question_by_topic(topic);
+        const generatedData = await get_question_by_topic(topic);
+        const questionsList = generatedData.questions ?? [];
 
-        const filePath = path.join(
-            process.cwd(),
-            "src",
-            "data",
-            "questions",
-            `${topic.toLowerCase().replaceAll(" ", "_")}.json`
-        );
-
-        await fs.writeFile(
-            filePath,
-            JSON.stringify(questions, null, 2),
-            "utf-8"
-        );
-
+        console.log("before session creation");
         const session = await prisma.session.create({
             data: {
                 session_id: uuidv4(),
                 topic,
                 asked_questions: [],
-                filePath
+                mastery: 0.1, // starting knowledge
+                confidence: 0.5,
+                engagement: 0.8,
+                cognitive_load: 0.2,
+                fatigue: 0.0,
+                history: [],
+                questions: {
+                    create: questionsList.map(q => ({
+                        id: q.id,
+                        difficulty: q.difficulty,
+                        questionType: q.questionType ?? "mcq",
+                        question: q.question,
+                        options: q.options,
+                        correctAnswer: q.correctAnswer,
+                        explanation: q.explanation ?? "",
+                        estimatedTimeSeconds: q.estimatedTimeSeconds ?? 30,
+                        concepts: q.concepts ?? [],
+                        tags: q.tags ?? [],
+                        learningObjective: q.learningObjective ?? "",
+                        prerequisiteLevel: q.prerequisiteLevel ?? 1,
+                        difficultyScore: q.difficultyScore ?? 1,
+                        sourceType: q.sourceType ?? "generated",
+                        asked: false
+                    }))
+                }
             }
         });
-
+        console.log("Session created with questions:", session);
+        console.log(session.session_id);
         return res.status(201).json({
             message: "Questions fetched and session created successfully",
             session_id: session.session_id
@@ -69,7 +104,7 @@ export const fetch_questions = async (req, res) => {
             message: "Failed to create session",
             error: error.message
         });
-    }
+    } 
 };
 
 export const get_first_question = async (req, res) => {
@@ -104,18 +139,28 @@ export const get_first_question = async (req, res) => {
             });
         }
 
-        await prisma.session.update({
-            where: {
-                session_id
-            },
-            data: {
-                asked_questions: [
-                    ...askedQuestions,
-                    question.id
-                ],
-                current_difficulty: question.difficulty
-            }
-        });
+        await prisma.$transaction([
+            prisma.question.update({
+                where: {
+                    question_id: question.question_id
+                },
+                data: {
+                    asked: true
+                }
+            }),
+            prisma.session.update({
+                where: {
+                    session_id
+                },
+                data: {
+                    asked_questions: [
+                        ...askedQuestions,
+                        question.id
+                    ],
+                    current_difficulty: question.difficulty
+                }
+            })
+        ]);
 
         return res.status(200).json({
             question
@@ -159,11 +204,20 @@ export const get_next_question = async (req, res) => {
             });
         }
 
-        const mastery_gain = await get_mastery(features, curr_session.filePath);
-        const isCorrect = mastery_gain > 0;
-        const updated_mastery = Math.max(
-            0,
-            curr_session.mastery + mastery_gain
+        const questions = await getQuestionsFromSession(curr_session);
+        const curr_question = questions.find(q => q.id === features.question_id);
+
+        if (!curr_question) {
+            return res.status(404).json({
+                error: "Question not found in session question list"
+            });
+        }
+
+        // Calculate next student state and next difficulty level
+        const { studentState, nextDifficulty, updatedHistory, isCorrect } = calculateStateAndNextQuestion(
+            curr_session,
+            curr_question,
+            features
         );
 
         const answerCounts = {
@@ -175,29 +229,37 @@ export const get_next_question = async (req, res) => {
                 : curr_session.wrong_answers + 1
         };
 
-        if (updated_mastery >= MASTERY_THRESHOLD) {
+        const updated_session_data = {
+            mastery: studentState.knowledge, // map knowledge to mastery
+            confidence: studentState.confidence,
+            engagement: studentState.engagement,
+            cognitive_load: studentState.cognitive_load,
+            fatigue: studentState.fatigue,
+            history: updatedHistory,
+            ...answerCounts
+        };
+
+        // Check if student has achieved mastery
+        if (studentState.knowledge >= MASTERY_THRESHOLD_NEW) {
             await prisma.session.update({
                 where: {
                     session_id
                 },
-                data: {
-                    mastery: updated_mastery,
-                    ...answerCounts
-                }
+                data: updated_session_data
             });
 
             return res.status(200).json({
                 topic_mastered: true,
-                mastery: updated_mastery
+                mastery: studentState.knowledge,
+                student_state: studentState
             });
         }
 
-        const next_difficulty = predict_next_difficulty(updated_mastery);
-        const questions = await getQuestionsFromSession(curr_session);
+        // Select the next question based on the calculated next difficulty
         const askedQuestions = curr_session.asked_questions ?? [];
         const next_question = pickQuestion(
             questions,
-            next_difficulty,
+            nextDifficulty,
             askedQuestions
         );
 
@@ -207,26 +269,36 @@ export const get_next_question = async (req, res) => {
             });
         }
 
-        await prisma.session.update({
-            where: {
-                session_id
-            },
-            data: {
-                mastery: updated_mastery,
-                current_difficulty: next_difficulty,
-                asked_questions: [
-                    ...askedQuestions,
-                    next_question.id
-                ],
-                ...answerCounts
-            }
-        });
+        await prisma.$transaction([
+            prisma.question.update({
+                where: {
+                    question_id: next_question.question_id
+                },
+                data: {
+                    asked: true
+                }
+            }),
+            prisma.session.update({
+                where: {
+                    session_id
+                },
+                data: {
+                    ...updated_session_data,
+                    current_difficulty: nextDifficulty,
+                    asked_questions: [
+                        ...askedQuestions,
+                        next_question.id
+                    ]
+                }
+            })
+        ]);
 
         return res.status(200).json({
             next_question,
             topic_mastered: false,
-            mastery: updated_mastery,
-            current_difficulty: next_difficulty
+            mastery: studentState.knowledge,
+            current_difficulty: nextDifficulty,
+            student_state: studentState
         });
 
     } catch (error) {
